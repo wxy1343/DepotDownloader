@@ -43,7 +43,8 @@ class ChunkDownload:
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.path = self.depot_downloader.save_path / self.mapping.filename
+        self.filepa = self.mapping.filename.replace('\\', '/')
+        self.path = self.depot_downloader.save_path / self.filepa
 
     def download(self, chunk):
         chunk_id = chunk.sha.hex()
@@ -56,7 +57,7 @@ class ChunkDownload:
             with self.path.open('rb+') as f:
                 f.seek(chunk.offset, 0)
                 f.write(data)
-            self.chunk_dict[self.mapping.filename].append(f'{chunk.offset}_{chunk.sha.hex()}')
+            self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
 
     def get_chunk(self, chunk_id):
         server = self.depot_downloader.get_content_server()
@@ -153,20 +154,21 @@ class DepotDownloader:
             for mapping in self.manifest.payload.mappings:
                 mapping.chunks.sort(key=lambda x: x.offset)
                 d = ChunkDownload(self, mapping)
-                path = self.save_path / mapping.filename
+                filepa = mapping.filename.replace('\\', '/')
+                path = self.save_path / filepa
                 if mapping.flags != 64:
                     if not path.exists():
-                        if mapping.filename in self.chunk_dict:
-                            self.chunk_dict[mapping.filename] = []
+                        if filepa in self.chunk_dict:
+                            self.chunk_dict[filepa] = []
                             self.save_chunk_dict()
                         if not path.parent.exists():
                             path.parent.mkdir(parents=True, exist_ok=True)
                         if not path.exists():
                             path.touch(exist_ok=True)
-                if mapping.filename not in self.chunk_dict:
-                    self.chunk_dict[mapping.filename] = []
+                if filepa not in self.chunk_dict:
+                    self.chunk_dict[filepa] = []
                 for chunk in mapping.chunks:
-                    if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[mapping.filename]:
+                    if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[filepa]:
                         result_list.append(
                             pool.apply_async(d.download, (chunk,), error_callback=d.error_callback))
                     else:
