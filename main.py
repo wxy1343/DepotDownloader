@@ -6,20 +6,21 @@ import json
 import struct
 import logging
 import argparse
+from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
 from urllib.parse import urljoin
+from steam.exceptions import SteamError
+from requests.adapters import HTTPAdapter
 from multiprocessing.pool import ThreadPool
 from multiprocessing.dummy import Pool, Lock
-
-from steam.client.cdn import get_content_servers_from_webapi
-from steam.exceptions import SteamError
 from steam.core.manifest import DepotManifest
 from steam.core.crypto import symmetric_decrypt
 from steam.utils.web import make_requests_session
+from steam.client.cdn import get_content_servers_from_webapi
 
 lock = Lock()
 parser = argparse.ArgumentParser()
@@ -35,6 +36,7 @@ parser.add_argument('-l', '--level', default='INFO')
 class ChunkDownload:
     def __init__(self, depot_downloader, mapping):
         self.depot_downloader = depot_downloader
+        self.tqdm: tqdm = self.depot_downloader.tqdm
         self.manifest = self.depot_downloader.manifest
         self.mapping = mapping
         self.download_size = 0
@@ -52,12 +54,14 @@ class ChunkDownload:
         with lock:
             self.download_size += chunk.cb_original
             self.depot_downloader.total_size += chunk.cb_original
-            self.log.info(
+            self.log.debug(
                 f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
             with self.path.open('rb+') as f:
                 f.seek(chunk.offset, 0)
                 f.write(data)
             self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
+        self.tqdm.set_postfix(filename=self.mapping.filename)
+        self.tqdm.update(chunk.cb_original)
 
     def get_chunk(self, chunk_id):
         server = self.depot_downloader.get_content_server()
@@ -127,6 +131,10 @@ class DepotDownloader:
             with self.chunk_list_path.open() as f:
                 self.chunk_dict = json.load(f)
         self.web = make_requests_session()
+        adapters = HTTPAdapter(max_retries=3, pool_connections=10000, pool_maxsize=10000)
+        self.web.mount('http://', adapters)
+        self.web.mount('https://', adapters)
+        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
 
     def get_content_server(self, servers=None, rotate=True):
         if servers:
@@ -174,6 +182,7 @@ class DepotDownloader:
                     else:
                         with lock:
                             self.total_size += chunk.cb_original
+                        self.tqdm.update(chunk.cb_original)
             try:
                 while pool._state == 'RUN':
                     if all([result.ready() for result in result_list]):

@@ -1,1 +1,2 @@
 steam[client]
+tqdm
