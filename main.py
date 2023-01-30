@@ -1,4 +1,3 @@
-import sys
 import vdf
 import time
 import lzma
@@ -23,14 +22,21 @@ from steam.utils.web import make_requests_session
 from steam.client.cdn import get_content_servers_from_webapi
 
 lock = Lock()
-parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--depot-id', required=True)
-parser.add_argument('-m', '--manifest-path', required=True)
-parser.add_argument('-k', '--depot-key', required=True)
+parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', default=32)
 parser.add_argument('-o', '--save-path')
-parser.add_argument('-s', '--server')
+parser.add_argument('-s', '--server', dest='server_list', action='append', nargs='?')
 parser.add_argument('-l', '--level', default='INFO')
+parser.add_argument('-r', '--retry-num', type=int, default=3)
+
+subparsers = parser.add_subparsers(dest='command', required=True)
+
+app_parser = subparsers.add_parser('app')
+app_parser.add_argument('-p', '--app-path', required=True)
+
+depot_parser = subparsers.add_parser('depot')
+depot_parser.add_argument('-m', '--manifest-path', dest='manifest_path_list', action='extend', nargs='+', required=True)
+depot_parser.add_argument('-k', '--depot-key', dest='depot_key_list', action='extend', nargs='+', required=True)
 
 
 class ChunkDownload:
@@ -109,32 +115,33 @@ class ChunkDownload:
 
 
 class DepotDownloader:
-    def __init__(self, manifest_path, depot_id, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO):
+    def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
+                 level=logging.INFO, retry_num=3):
         self.manifest_path = manifest_path
-        self.depot_id = depot_id
         self.depot_key = depot_key
         self.thread_num = thread_num
         self.total_size = 0
         self.log = logging.getLogger(self.__class__.__name__)
         logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
                             level=level)
-        self.chunk_list_path = Path(f'{self.depot_id}.json')
-        self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         self.servers = deque()
         self.get_content_server(servers)
         with open(self.manifest_path, 'rb') as f:
             content = f.read()
         self.manifest = DepotManifest(content)
+        self.depot_id = self.manifest.depot_id
+        self.chunk_list_path = Path(f'{self.depot_id}.json')
+        self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         self.chunk_dict = {}
         if self.chunk_list_path.exists():
             with self.chunk_list_path.open() as f:
                 self.chunk_dict = json.load(f)
         self.web = make_requests_session()
-        adapters = HTTPAdapter(max_retries=3, pool_connections=10000, pool_maxsize=10000)
+        adapters = HTTPAdapter(max_retries=retry_num, pool_connections=10000, pool_maxsize=10000)
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
+        self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
     def get_content_server(self, servers=None, rotate=True):
         if servers:
@@ -197,24 +204,65 @@ class DepotDownloader:
                 self.save_chunk_dict()
 
 
+def get_manifest_path_depot_key_dict(path):
+    path = Path(path)
+    if not path.is_dir():
+        raise NotADirectoryError(path)
+    manifest_path_list = []
+    depot_dict = {}
+    for file in path.iterdir():
+        if file.is_file():
+            if file.suffix == '.manifest':
+                manifest_path_list.append(file)
+            elif file.name == 'config.vdf':
+                with file.open() as f:
+                    d = vdf.load(f)
+                depots = d.get('depots')
+                if not depots:
+                    return {}
+                for depot_id in depots:
+                    depot_key = depots[depot_id].get('DecryptionKey')
+                    if not depot_key:
+                        continue
+                    depot_dict[int(depot_id)] = depot_key
+    manifest_path_depot_key_dict = {}
+    for manifest_path in manifest_path_list:
+        with manifest_path.open('rb') as f:
+            content = f.read()
+        manifest = DepotManifest(content)
+        if manifest.depot_id not in depot_dict:
+            continue
+        depot_key = depot_dict[manifest.depot_id]
+        manifest_path_depot_key_dict[manifest_path] = depot_key
+    return manifest_path_depot_key_dict
+
+
 def main(args=None):
     if args:
         args = parser.parse_args(args)
     else:
-        if len(sys.argv) == 2 and sys.argv[1] and sys.argv[1].endswith('.manifest'):
-            path = Path(sys.argv[1])
-            depot_id, _ = path.stem.split('_')
-            with (path.parent / 'config.vdf').open() as f:
-                depot_key = vdf.load(f).get('depots')[depot_id]['DecryptionKey']
-            args = parser.parse_args(f'-d {depot_id} -m {sys.argv[1]} -k {depot_key}'.split())
-        else:
-            args = parser.parse_args()
+        args = parser.parse_args()
     if args.level:
         level = logging.getLevelName(args.level.upper())
     else:
         level = logging.INFO
-    DepotDownloader(args.manifest_path, args.depot_id, args.depot_key, args.thread_num, args.save_path,
-                    args.server.split(',') if args.server else None, level).download()
+    manifest_path_depot_key_dict = {}
+    save_path = args.save_path
+    if args.command == 'app':
+        manifest_path_depot_key_dict = get_manifest_path_depot_key_dict(args.app_path)
+        if manifest_path_depot_key_dict and args.app_path and not save_path:
+            save_path = Path().absolute() / Path(args.app_path).name
+    elif args.command == 'depot':
+        manifest_path_depot_key_dict = dict(zip(args.manifest_path_list, args.depot_key_list))
+    server_set = set()
+    if args.server_list:
+        for server in args.server_list:
+            server_set.update(server.split(','))
+    if manifest_path_depot_key_dict:
+        for manifest_path, depot_key in manifest_path_depot_key_dict.items():
+            if manifest_path and depot_key:
+                DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
+                                args.retry_num).download()
 
 
 if __name__ == '__main__':

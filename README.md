@@ -1,24 +1,34 @@
 # steam仓库清单文件下载
 
-## 参数
+## 全局参数
 
-* `-d, --depot-id`: 仓库id
-* `-m, --manifest-path`: 清单文件路径
-* `-k, --depot-key`: 仓库密钥
 * `-t, --thread-num`: 线程数(默认32)
 * `-o, --save-path`: 下载路径
-* `-s, --server`: 指定cdn下载
+* `-s, --server`: 指定cdn下载,可指定多个或`,`分隔
 * `-l, --level`: 日志等级
+* `-r, --retry-num`: 重试次数(默认3)
+
+## 子命令参数
+
+* `app`: 下载全部清单
+    * `-p, --app-path`: 清单目录
+        * [目录结构](https://github.com/wxy1343/ManifestAutoUpdate/tree/10)
+            * `*.manifest`: 清单文件
+            * `config.vdf`: 密钥文件
+* `depot`: 单独下载清单
+    * `-m, --manifest-path`: 清单文件路径,可指定多个或`空格`分隔
+    * `-k, --depot-key`: 仓库密钥,可指定多个或`空格`分隔
 
 ## 使用示例
 
-* `python main.py --depot-id 368010 --manifest-path "368010_6622130648560741481.manifest" --depot-key ef8ea30154f995c4e4226df06f5cc39705ef0fc2d800f948613d1b3dd6b6437e`
+* `python main.py app --app-path ./10`
+* `python main.py depot --manifest-path "368010_6622130648560741481.manifest" --depot-key ef8ea30154f995c4e4226df06f5cc39705ef0fc2d800f948613d1b3dd6b6437e`
 
 ## 下载加速
 
 1. 指定cdn下载
-    * 使用示例：`python main.py ... -s https://google.cdn.steampipe.steamcontent.com`
-    * 指定多个用`,`分开
+    * 使用示例：`python main.py -s https://google.cdn.steampipe.steamcontent.com {app,depot} ...`
+    * 指定多个用`,`分开,或者指定多个`-s`
     * cdn列表
         * google
             * `https://google.cdn.steampipe.steamcontent.com`
