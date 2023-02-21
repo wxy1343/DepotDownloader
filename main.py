@@ -62,9 +62,14 @@ class ChunkDownload:
             self.depot_downloader.total_size += chunk.cb_original
             self.log.debug(
                 f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
-            with self.path.open('rb+') as f:
-                f.seek(chunk.offset, 0)
-                f.write(data)
+            while True:
+                try:
+                    with self.path.open('rb+') as f:
+                        f.seek(chunk.offset, 0)
+                        f.write(data)
+                    break
+                except PermissionError:
+                    pass
             self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
         self.tqdm.set_postfix(filename=self.mapping.filename)
         self.tqdm.update(chunk.cb_original)
