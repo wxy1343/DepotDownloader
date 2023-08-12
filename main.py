@@ -242,16 +242,28 @@ def update_cdn_token(depot_downloader, address):
         client.anonymous_login()
 
     cdn_auth_token = client.get_cdn_auth_token(depot_downloader.depot_id, urlparse(address).hostname)
-
-    if cdn_auth_token.eresult == 1:
-        depot_downloader.servers_token[address] = cdn_auth_token.token
-        timer = Timer(cdn_auth_token.expiration_time - time.time(),
-            update_cdn_token,
-            [depot_downloader ,address])
-        timer.start()
-        timers.append(timer)
-    else:
-        depot_downloader.servers_token[address] = ''
+ 
+    maxtime = 3
+    nowtime = 0
+    while True:
+        if nowtime < maxtime:
+            raise SteamError('Failed to get cdn_auth_token')
+        try:
+            if cdn_auth_token.eresult == 1:
+                depot_downloader.servers_token[address] = cdn_auth_token.token
+                timer = Timer(cdn_auth_token.expiration_time - time.time(),
+                    update_cdn_token,
+                    [depot_downloader ,address])
+                timer.start()
+                timers.append(timer)
+            else:
+                depot_downloader.servers_token[address] = ''
+            break
+        except NameError or AttributeError:
+            nowtime += 1
+            # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
+            client.disconnect()
+            client.connect()
 
     depot_downloader.log.debug('Token: '+cdn_auth_token.token+
         ', expiration_time: '+str(cdn_auth_token.expiration_time))
