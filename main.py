@@ -11,7 +11,7 @@ from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
-from urllib.parse import urljoin
+from urllib.parse import urlparse
 from threading import Timer
 from steam.exceptions import SteamError
 from requests.adapters import HTTPAdapter
@@ -27,6 +27,7 @@ lock = Lock()
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', default=32)
 parser.add_argument('-o', '--save-path')
+parser.add_argument('-c', '--login-anonymous', action='store_true', help='login anonymously and enable request cdn auth token')
 parser.add_argument('-s', '--server', dest='server_list', action='append', nargs='?')
 parser.add_argument('-l', '--level', default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=3)
@@ -80,7 +81,7 @@ class ChunkDownload:
         server, token = self.depot_downloader.get_content_server()
 
         while True:
-            url = urljoin(server, f'depot/{self.depot_id}/chunk/{chunk_id}{token}')
+            url = f'{server}/depot/{self.depot_id}/chunk/{chunk_id}{token}'
             try:
                 resp = self.depot_downloader.web.get(url, timeout=10)
             except Exception as exp:
@@ -154,6 +155,11 @@ class DepotDownloader:
     def get_content_server(self, servers=None, rotate=False):
         if servers:
             self.servers.extend(servers)
+            for server_address in servers:
+                self.log.info('Server: '+server_address)
+                if args.login_anonymous:
+                    update_cdn_token(self, server_address)
+
         if not self.servers:
             self.log.info("Trying to fetch content servers from Steam API")
             # 获取内容服务器信息
@@ -165,32 +171,24 @@ class DepotDownloader:
                 # 生成服务器地址
                 server_address = f"{'https' if server.https else 'http'}://{server.host}:{server.port}"
                 self.log.info('Server: '+server_address)
-                # 获取 CDN 认证令牌
-                cdn_auth_token = client.get_cdn_auth_token(self.depot_id, server.host)
-                # 将服务器地址与对应的 CDN 认证令牌添加到字典中
-                if cdn_auth_token.eresult == 1:
-                    self.log.debug('Token: '+cdn_auth_token.token+
-                        ', expiration_time: '+str(cdn_auth_token.expiration_time))
-                    self.servers_token[server_address] = cdn_auth_token.token
-                    timer = Timer(cdn_auth_token.expiration_time - time.time(),
-                          update_cdn_token,
-                          (server_address, server.host))
-                    timer.start()
-                    timers.append(timer)
-                else:
-                    self.servers_token[server_address] = ''
-
                 # 将生成的服务器地址添加到 self.servers 列表中
                 self.servers.append(server_address)
+                # 获取 CDN 认证令牌
+                if args.login_anonymous:
+                    update_cdn_token(self, server_address)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
+
         if rotate:
             self.servers.rotate(-1)
 
         server_address = self.servers[0]
-        cdn_auth_token = self.servers_token[server_address]
-        return server_address, cdn_auth_token
+        if args.login_anonymous:
+            cdn_auth_token = self.servers_token[server_address]
+            return server_address, cdn_auth_token
+        else:
+            return server_address, ''
 
     def save_chunk_dict(self):
         with lock:
@@ -239,15 +237,24 @@ class DepotDownloader:
                 self.save_chunk_dict()
 
 
-def update_cdn_token(self, address, host):
-    self.log.debug("Updating CDN token for "+host)
-    cdn_auth_token = client.get_cdn_auth_token(self.depot_id, host)
-    self.servers_token[address] = cdn_auth_token.token
-    timer = Timer(cdn_auth_token.expiration_time - time.time(),
-        update_cdn_token,
-        [address, host])
-    timer.start()
-    timers.append(timer)
+def update_cdn_token(depot_downloader, address):
+    if not client.connected:
+        client.anonymous_login()
+
+    cdn_auth_token = client.get_cdn_auth_token(depot_downloader.depot_id, urlparse(address).hostname)
+
+    if cdn_auth_token.eresult == 1:
+        depot_downloader.servers_token[address] = cdn_auth_token.token
+        timer = Timer(cdn_auth_token.expiration_time - time.time(),
+            update_cdn_token,
+            [depot_downloader ,address])
+        timer.start()
+        timers.append(timer)
+    else:
+        depot_downloader.servers_token[address] = ''
+
+    depot_downloader.log.debug('Token: '+cdn_auth_token.token+
+        ', expiration_time: '+str(cdn_auth_token.expiration_time))
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
@@ -282,13 +289,14 @@ def get_manifest_path_depot_key_dict(path):
     return manifest_path_depot_key_dict
 
 
-def main(args=None):
-    global client, timers
+def main(aargs=None):
+    global client, timers, args
     timers = []
-    client = SteamClient()
-    client.anonymous_login()
-    if args:
-        args = parser.parse_args(args)
+    if args.login_anonymous:
+        client = SteamClient()
+        client.anonymous_login()
+    if aargs:
+        args = parser.parse_args(aargs)
     else:
         args = parser.parse_args()
     if args.level:
@@ -306,7 +314,8 @@ def main(args=None):
     server_set = set()
     if args.server_list:
         for server in args.server_list:
-            server_set.update(server.split(','))
+            if type(server) == str:
+                server_set.update(server.split(','))
     if manifest_path_depot_key_dict:
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
