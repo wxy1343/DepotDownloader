@@ -292,13 +292,13 @@ def get_manifest_path_depot_key_dict(path):
 def main(aargs=None):
     global client, timers, args
     timers = []
-    if args.login_anonymous:
-        client = SteamClient()
-        client.anonymous_login()
     if aargs:
         args = parser.parse_args(aargs)
     else:
         args = parser.parse_args()
+    if args.login_anonymous:
+        client = SteamClient()
+        client.anonymous_login()
     if args.level:
         level = logging.getLevelName(args.level.upper())
     else:
