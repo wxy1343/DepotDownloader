@@ -193,7 +193,7 @@ class DepotDownloader:
             if cdn_auth_token.eresult == 1:
                 timeleft = cdn_auth_token.expiration_time - time.time()
                 if timeleft < 600: # 小于10分钟
-                    self.update_cdn_token(server_address)
+                    cdn_auth_token = self.update_cdn_token(server_address)
             return server_address, cdn_auth_token.token
         else:
             return server_address, ''
@@ -266,6 +266,7 @@ class DepotDownloader:
                 # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
                 self.client.disconnect()
                 self.client.connect()
+        return cdn_auth_token
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
