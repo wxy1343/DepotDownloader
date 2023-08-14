@@ -192,7 +192,7 @@ class DepotDownloader:
             cdn_auth_token = self.servers_token[server_address]
             if cdn_auth_token.eresult == 1:
                 timeleft = cdn_auth_token.expiration_time - time.time()
-                if timeleft < 600: # 小于10分钟
+                if timeleft < 300: # 小于5分钟
                     cdn_auth_token = self.update_cdn_token(server_address)
             return server_address, cdn_auth_token.token
         else:
@@ -248,20 +248,21 @@ class DepotDownloader:
         if not self.client.connected:
             self.client.anonymous_login()
 
-        cdn_auth_token = self.client.get_cdn_auth_token(self.depot_id, urlparse(server_address).hostname)
-    
         maxtime = 3
         nowtime = 0
         while True:
-            if nowtime > maxtime:
-                raise SteamError('Failed to get cdn_auth_token')
             try:
+                cdn_auth_token = self.client.get_cdn_auth_token(self.depot_id, urlparse(server_address).hostname)
                 self.servers_token[server_address] = cdn_auth_token
-                self.log.debug(f'Server: {server_address},\
-                            Token: {cdn_auth_token.token},\
-                            expiration_time: {cdn_auth_token.expiration_time}')
+                self.log.debug('Server: %s, Token: %s, expiration_time: %s' % (
+                    server_address,
+                    cdn_auth_token.token,
+                    cdn_auth_token.expiration_time
+                    ))
                 break
-            except (NameError, AttributeError, TypeError):
+            except (NameError, AttributeError, TypeError) as e:
+                if nowtime > maxtime:
+                    raise SteamError(f'Failed to get cdn_auth_token: {e}')
                 nowtime += 1
                 # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
                 self.client.disconnect()
