@@ -5,28 +5,32 @@ import json
 import struct
 import logging
 import argparse
+import threading
+import traceback
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
+from steam.enums import EResult
 from urllib.parse import urlparse
+from steam.client import SteamClient
 from steam.exceptions import SteamError
 from requests.adapters import HTTPAdapter
 from multiprocessing.pool import ThreadPool
 from multiprocessing.dummy import Pool, Lock
 from steam.core.manifest import DepotManifest
-from steam.client import SteamClient
 from steam.core.crypto import symmetric_decrypt
 from steam.utils.web import make_requests_session
 from steam.client.cdn import get_content_servers_from_webapi
+from steam.protobufs.steammessages_clientserver_2_pb2 import CMsgClientGetCDNAuthTokenResponse
 
-lock = Lock()
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', default=32)
 parser.add_argument('-o', '--save-path')
-parser.add_argument('-c', '--login-anonymous', action='store_true', help='login anonymously and enable request cdn auth token')
+parser.add_argument('-c', '--login-anonymous', action='store_true',
+                    help='login anonymously and enable request cdn auth token')
 parser.add_argument('-s', '--server', dest='server_list', action='append', nargs='?')
 parser.add_argument('-l', '--level', default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=3)
@@ -55,15 +59,17 @@ class ChunkDownload:
         self.log = self.depot_downloader.log
         self.filepa = self.mapping.filename.replace('\\', '/')
         self.path = self.depot_downloader.save_path / self.filepa
+        self.lock = Lock()
 
     def download(self, chunk):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id)
-        with lock:
+        with self.depot_downloader.lock:
             self.download_size += chunk.cb_original
             self.depot_downloader.total_size += chunk.cb_original
             self.log.debug(
                 f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
+        with self.lock:
             while True:
                 try:
                     with self.path.open('rb+') as f:
@@ -72,7 +78,7 @@ class ChunkDownload:
                     break
                 except PermissionError:
                     pass
-            self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
+        self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
         self.tqdm.set_postfix(filename=self.mapping.filename)
         self.tqdm.update(chunk.cb_original)
 
@@ -118,16 +124,35 @@ class ChunkDownload:
         return data
 
     def error_callback(self, e):
-        self.log.error(e)
+        self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
+
+
+class SingletonSteamClient(SteamClient):
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        cls.lock = Lock()
+        if not cls._instance:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+        return cls._instance
+
+    def __enter__(self):
+        self.lock.acquire()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.lock.release()
 
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=3, expect_logged_in=False):
+        self.lock = Lock()
+        self.cdn_auth_code_updating = False
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
-            self.client = SteamClient()
-            self.client.anonymous_login()
+            self.client = SingletonSteamClient()
+            with self.client:
+                self.client.anonymous_login()
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.thread_num = thread_num
@@ -159,7 +184,7 @@ class DepotDownloader:
         if servers:
             self.servers.extend(servers)
             for server_address in servers:
-                self.log.info('Added server: '+server_address)
+                self.log.info('Added server: ' + server_address)
                 if self.expect_logged_in:
                     self.update_cdn_token(server_address)
 
@@ -174,7 +199,7 @@ class DepotDownloader:
             for server in sorted_servers:
                 # 生成服务器地址
                 server_address = f"{'https' if server.https else 'http'}://{server.host}:{server.port}"
-                self.log.info('Added server: '+server_address)
+                self.log.info('Added server: ' + server_address)
                 # 将生成的服务器地址添加到 self.servers 列表中
                 self.servers.append(server_address)
                 # 获取 CDN Auth Token
@@ -189,17 +214,36 @@ class DepotDownloader:
 
         server_address = self.servers[0]
         if self.expect_logged_in:
-            cdn_auth_token = self.servers_token[server_address]
-            if cdn_auth_token.eresult == 1:
+            with self.lock:
+                cdn_auth_token = self.servers_token[server_address]
+            assert (cdn_auth_token.eresult == EResult.OK)
+            if cdn_auth_token.expiration_time != 0:
                 timeleft = cdn_auth_token.expiration_time - time.time()
-                if timeleft < 300: # 小于5分钟
-                    cdn_auth_token = self.update_cdn_token(server_address)
+                if timeleft < 60:
+                    try:
+                        cdn_auth_token = self.update_cdn_token(server_address)
+                    except SteamError:
+                        with self.lock:
+                            for server_address, cdn_auth_token in self.servers_token.items():
+                                if cdn_auth_token.eresult == EResult.OK:
+                                    break
+                            else:
+                                raise
+                elif timeleft < 300:  # 小于5分钟
+                    with self.lock:
+                        if not self.cdn_auth_code_updating:
+                            self.cdn_auth_code_updating = True
+                            threading.Thread(
+                                target=lambda:
+                                self.update_cdn_token(server_address) and
+                                setattr(self, 'cdn_auth_code_updating', False)).start()
+
             return server_address, cdn_auth_token.token
         else:
             return server_address, ''
 
     def save_chunk_dict(self):
-        with lock:
+        with self.lock:
             with open(self.chunk_list_path, 'w') as f:
                 json.dump(self.chunk_dict, f)
 
@@ -228,7 +272,7 @@ class DepotDownloader:
                         result_list.append(
                             pool.apply_async(d.download, (chunk,), error_callback=d.error_callback))
                     else:
-                        with lock:
+                        with self.lock:
                             self.total_size += chunk.cb_original
                         self.tqdm.update(chunk.cb_original)
             try:
@@ -240,34 +284,49 @@ class DepotDownloader:
             except KeyboardInterrupt:
                 pass
             finally:
-                with lock:
+                with self.lock:
                     pool.terminate()
                 self.save_chunk_dict()
 
     def update_cdn_token(self, server_address):
-        if not self.client.connected:
-            self.client.anonymous_login()
+        with self.client:
+            if not self.client.connected:
+                self.client.anonymous_login()
 
-        maxtime = 3
-        nowtime = 0
+        retry = 3
         while True:
             try:
-                cdn_auth_token = self.client.get_cdn_auth_token(self.depot_id, urlparse(server_address).hostname)
-                self.servers_token[server_address] = cdn_auth_token
-                self.log.debug('Server: %s, Token: %s, expiration_time: %s' % (
+                hostname = urlparse(str(server_address)).hostname
+                if hostname.endswith('.steamcontent.com'):
+                    cdn_auth_token = CMsgClientGetCDNAuthTokenResponse()
+                    cdn_auth_token.token = ''
+                    cdn_auth_token.expiration_time = 0
+                    cdn_auth_token.eresult = EResult.OK
+                else:
+                    with self.client:
+                        cdn_auth_token = self.client.get_cdn_auth_token(self.depot_id, hostname)
+                self.log.debug('Server: %s, Token: %s, expiration_time: %s, eresult: %s' % (
                     server_address,
                     cdn_auth_token.token,
-                    cdn_auth_token.expiration_time
-                    ))
-                break
+                    cdn_auth_token.expiration_time,
+                    EResult(cdn_auth_token.eresult).name
+                ))
+                if cdn_auth_token.eresult == EResult.OK:
+                    with self.lock:
+                        self.servers_token[server_address] = cdn_auth_token
+                    break
+                self.log.warning('Failed to get cdn_auth_token: %s, eresult: %s' % (
+                    server_address, EResult(cdn_auth_token.eresult).name))
             except (NameError, AttributeError, TypeError) as e:
-                if nowtime > maxtime:
+                if not retry:
                     raise SteamError(f'Failed to get cdn_auth_token: {e}')
-                nowtime += 1
-                # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
-                self.client.disconnect()
-                self.client.connect()
+                retry -= 1
+                with self.client:
+                    # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
+                    self.client.disconnect()
+                    self.client.connect()
         return cdn_auth_token
+
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
