@@ -3,6 +3,7 @@ import time
 import lzma
 import json
 import gevent
+import shutil
 import struct
 import logging
 import argparse
@@ -81,7 +82,7 @@ class ChunkDownload:
                 except PermissionError:
                     pass
         self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
-        self.tqdm.set_postfix(filename=self.mapping.filename)
+        self.tqdm.set_postfix(filename=self.mapping.filename[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
 
     def get_chunk(self, chunk_id):
@@ -504,7 +505,10 @@ def main(args=None):
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
                                     args.retry_num, args.login_anonymous)
                 result_list.append(gevent.spawn(d.download))
-        gevent.joinall(result_list)
+        try:
+            gevent.joinall(result_list)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == '__main__':
