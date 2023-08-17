@@ -131,9 +131,9 @@ class SingletonSteamClient(SteamClient):
     _instance = None
 
     def __new__(cls, *args, **kwargs):
-        cls.lock = Lock()
         if not cls._instance:
             cls._instance = super().__new__(cls, *args, **kwargs)
+            cls._instance.lock = Lock()
         return cls._instance
 
     def __enter__(self):
@@ -152,7 +152,10 @@ class DepotDownloader:
         if expect_logged_in:
             self.client = SingletonSteamClient()
             with self.client:
-                self.client.anonymous_login()
+                if not self.client.logged_on:
+                    result = self.client.anonymous_login()
+                    if result != EResult.OK:
+                        raise SteamError(f'Login failure reason: {result.__repr__()}')
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.thread_num = thread_num
@@ -225,7 +228,12 @@ class DepotDownloader:
                     except SteamError:
                         with self.lock:
                             for server_address, cdn_auth_token in self.servers_token.items():
-                                if cdn_auth_token.eresult == EResult.OK:
+                                if cdn_auth_token.eresult != EResult.OK:
+                                    continue
+                                if cdn_auth_token.expiration_time == 0:
+                                    break
+                                timeleft = cdn_auth_token.expiration_time - time.time()
+                                if timeleft > 60:
                                     break
                             else:
                                 raise
