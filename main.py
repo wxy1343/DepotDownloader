@@ -6,7 +6,6 @@ import gevent
 import struct
 import logging
 import argparse
-import threading
 import traceback
 from tqdm import tqdm
 from io import BytesIO
@@ -15,6 +14,7 @@ from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
 from steam.enums import EResult
+from gevent.lock import Semaphore
 from urllib.parse import urlparse
 from steam.client import SteamClient
 from steam.exceptions import SteamError
@@ -69,7 +69,8 @@ class ChunkDownload:
             self.download_size += chunk.cb_original
             self.depot_downloader.total_size += chunk.cb_original
             self.log.debug(
-                f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
+                f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/'
+                f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
         with self.lock:
             while True:
                 try:
@@ -140,23 +141,133 @@ class SingletonSteamClient(SteamClient):
     def __init__(self):
         if not self._initialized:
             self._initialized = True
+            self._lock = Semaphore(1)
             super().__init__()
-            self.servers_token = {}
             result = self.anonymous_login()
             if result != EResult.OK:
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
 
 
+class SingletonDict(dict):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self, *args, **kwargs):
+        if not self._initialized:
+            self._initialized = True
+            self._lock = Semaphore(1)
+            super().__init__(*args, **kwargs)
+
+    def __getitem__(self, key):
+        with self._lock:
+            return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            return super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        with self._lock:
+            return super().__delitem__(key)
+
+    def __len__(self):
+        with self._lock:
+            return super().__len__()
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(key)
+
+
+class SingletonDeque(deque):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self, *args, **kwargs):
+        if not self._initialized:
+            self._initialized = True
+            self._lock = Semaphore(1)
+            super().__init__(*args, **kwargs)
+
+    def append(self, item):
+        with self._lock:
+            super().append(item)
+
+    def appendleft(self, item):
+        with self._lock:
+            super().appendleft(item)
+
+    def pop(self):
+        with self._lock:
+            return super().pop()
+
+    def popleft(self):
+        with self._lock:
+            return super().popleft()
+
+    def __len__(self):
+        with self._lock:
+            return super().__len__()
+
+    def __contains__(self, item):
+        with self._lock:
+            return super().__contains__(item)
+
+    def __getitem__(self, index):
+        with self._lock:
+            return super().__getitem__(index)
+
+    def __setitem__(self, index, value):
+        with self._lock:
+            super().__setitem__(index, value)
+
+    def __delitem__(self, index):
+        with self._lock:
+            super().__delitem__(index)
+
+    def __iter__(self):
+        with self._lock:
+            return super().__iter__()
+
+    def __reversed__(self):
+        with self._lock:
+            return super().__reversed__()
+
+
+class SingletonSemaphore(Semaphore):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self, *args, **kwargs):
+        if not self._initialized:
+            self._initialized = True
+            super().__init__(*args, **kwargs)
+
+
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=3, expect_logged_in=False):
-        self.lock = Lock()
+        self.lock = SingletonSemaphore(1)
         self.cdn_auth_code_updating = False
         self.expect_logged_in = expect_logged_in
-        self.servers_token = {}
         if expect_logged_in:
-            self.client = SingletonSteamClient()
-            self.servers_token = self.client.servers_token
+            with self.lock:
+                self.client = SingletonSteamClient()
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.thread_num = thread_num
@@ -168,13 +279,14 @@ class DepotDownloader:
             content = f.read()
         self.manifest = DepotManifest(content)
         self.depot_id = self.manifest.depot_id
-        self.servers = deque()
+        self.servers = SingletonDeque()
+        self.servers_token = SingletonDict()
         self.get_content_server(servers)
         self.chunk_list_path = Path(f'{self.depot_id}.json')
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         self.chunk_dict = {}
         if self.chunk_list_path.exists():
-            with self.chunk_list_path.open() as f:
+            with self.chunk_list_path.open(encoding='utf-8') as f:
                 self.chunk_dict = json.load(f)
         self.web = make_requests_session()
         adapters = HTTPAdapter(max_retries=retry_num, pool_connections=10000, pool_maxsize=10000)
@@ -185,11 +297,13 @@ class DepotDownloader:
 
     def get_content_server(self, servers=None, rotate=False):
         if servers:
-            self.servers.extend(servers)
             for server_address in servers:
-                self.log.info('Added server: ' + server_address)
-                if self.expect_logged_in and server_address not in self.servers_token:
-                    self.update_cdn_token(server_address)
+                with self.lock:
+                    if server_address not in self.servers:
+                        self.log.info('Added server: ' + server_address)
+                        self.servers.append(server_address)
+                    if self.expect_logged_in and server_address not in self.servers_token:
+                        self.update_cdn_token(server_address)
 
         if not self.servers:
             self.log.info("Trying to fetch content servers from Steam API")
@@ -202,12 +316,14 @@ class DepotDownloader:
             for server in sorted_servers:
                 # 生成服务器地址
                 server_address = f"{'https' if server.https else 'http'}://{server.host}:{server.port}"
-                self.log.info('Added server: ' + server_address)
-                # 将生成的服务器地址添加到 self.servers 列表中
-                self.servers.append(server_address)
-                # 获取 CDN Auth Token
-                if self.expect_logged_in and server_address not in self.servers_token:
-                    self.update_cdn_token(server_address)
+                with self.lock:
+                    if server_address not in self.servers:
+                        self.log.info('Added server: ' + server_address)
+                        # 将生成的服务器地址添加到 self.servers 列表中
+                        self.servers.append(server_address)
+                    # 获取 CDN Auth Token
+                    if self.expect_logged_in and server_address not in self.servers_token:
+                        self.update_cdn_token(server_address)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
@@ -224,7 +340,8 @@ class DepotDownloader:
                 timeleft = cdn_auth_token.expiration_time - time.time()
                 if timeleft < 60:
                     try:
-                        cdn_auth_token = self.update_cdn_token(server_address)
+                        with self.lock:
+                            cdn_auth_token = self.update_cdn_token(server_address)
                     except SteamError:
                         with self.lock:
                             for server_address, cdn_auth_token in self.servers_token.items():
@@ -236,10 +353,9 @@ class DepotDownloader:
                     with self.lock:
                         if not self.cdn_auth_code_updating:
                             self.cdn_auth_code_updating = True
-                            threading.Thread(
-                                target=lambda:
-                                self.update_cdn_token(server_address) and
-                                setattr(self, 'cdn_auth_code_updating', False)).start()
+                            gevent.spawn(lambda:
+                                         self.update_cdn_token(server_address) and
+                                         setattr(self, 'cdn_auth_code_updating', False))
 
             return server_address, cdn_auth_token.token
         else:
@@ -247,7 +363,7 @@ class DepotDownloader:
 
     def save_chunk_dict(self):
         with self.lock:
-            with open(self.chunk_list_path, 'w') as f:
+            with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
                 json.dump(self.chunk_dict, f)
 
     def download(self):
@@ -292,12 +408,11 @@ class DepotDownloader:
                 self.save_chunk_dict()
 
     def update_cdn_token(self, server_address):
-        if not self.client.connected:
-            self.client.anonymous_login()
-
         retry = 3
         while True:
             try:
+                if not self.client.connected:
+                    self.client.anonymous_login()
                 hostname = urlparse(str(server_address)).hostname
                 if hostname.endswith('.steamcontent.com'):
                     cdn_auth_token = CMsgClientGetCDNAuthTokenResponse()
@@ -313,18 +428,16 @@ class DepotDownloader:
                     EResult(cdn_auth_token.eresult).name
                 ))
                 if cdn_auth_token.eresult == EResult.OK:
-                    with self.lock:
-                        self.servers_token[server_address] = cdn_auth_token
+                    self.servers_token[server_address] = cdn_auth_token
                     break
                 self.log.warning('Failed to get cdn_auth_token: %s, eresult: %s' % (
                     server_address, EResult(cdn_auth_token.eresult).name))
-            except (NameError, AttributeError, TypeError) as e:
+            except (NameError, AttributeError, TypeError, RuntimeError) as e:
                 if not retry:
                     raise SteamError(f'Failed to get cdn_auth_token: {e}')
                 retry -= 1
                 # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
                 self.client.disconnect()
-                self.client.connect()
                 self.client.anonymous_login()
         return cdn_auth_token
 
@@ -385,10 +498,13 @@ def main(args=None):
             if type(server) == str:
                 server_set.update(server.split(','))
     if manifest_path_depot_key_dict:
+        result_list = []
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
-                DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                args.retry_num, args.login_anonymous).download()
+                d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
+                                    args.retry_num, args.login_anonymous)
+                result_list.append(gevent.spawn(d.download))
+        gevent.joinall(result_list)
 
 
 if __name__ == '__main__':
